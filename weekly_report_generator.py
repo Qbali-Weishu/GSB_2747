@@ -14,6 +14,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 import argparse
+import json
 
 import pandas as pd
 import numpy as np
@@ -58,7 +59,11 @@ class WeeklyReportGenerator:
                  week_start_day: Optional[int] = None,
                  custom_start_date: Optional[str] = None,
                  custom_end_date: Optional[str] = None):
-        self.config_path = config_path
+        
+        self.config_path_original = config_path
+        self.config_path = os.path.abspath(config_path)
+        self.config_dir = os.path.dirname(self.config_path)
+        
         self.config = None
         self.logger = None
         self.execution_results: List[StepResult] = []
@@ -75,12 +80,20 @@ class WeeklyReportGenerator:
         self.week_start_date: Optional[datetime] = None
         self.week_end_date: Optional[datetime] = None
         self.week_info: Dict[str, Any] = {}
+        
+        self._is_loaded = False
+        self._has_run = False
+    
+    def _resolve_path(self, path: str) -> str:
+        if os.path.isabs(path):
+            return path
+        return os.path.abspath(os.path.join(self.config_dir, path))
     
     def load_config(self) -> bool:
         step_result = StepResult(
             step_name="加载配置文件",
             status=StepStatus.RUNNING,
-            message="正在加载配置文件...",
+            message=f"正在加载配置文件: {self.config_path}...",
             start_time=datetime.now()
         )
         
@@ -90,6 +103,8 @@ class WeeklyReportGenerator:
             
             if not self.config or 'weekly_report' not in self.config:
                 raise ValueError("配置文件格式错误，缺少 weekly_report 节点")
+            
+            self._is_loaded = True
             
             step_result.status = StepStatus.SUCCESS
             step_result.message = f"配置文件加载成功，版本: {self.config['weekly_report'].get('version', '未知')}"
@@ -122,7 +137,7 @@ class WeeklyReportGenerator:
             log_format = log_config.get('format', '%(asctime)s - %(levelname)s - [%(step)s] - %(message)s')
             console_output = log_config.get('console_output', True)
             
-            log_file = log_file_template.replace('{timestamp}', self.timestamp)
+            log_file = self._resolve_path(log_file_template.replace('{timestamp}', self.timestamp))
             log_dir = os.path.dirname(log_file)
             if log_dir and not os.path.exists(log_dir):
                 os.makedirs(log_dir, exist_ok=True)
@@ -237,6 +252,109 @@ class WeeklyReportGenerator:
             self._log_error(step_result)
             return False
     
+    def load_data_sources(self) -> bool:
+        step_result = StepResult(
+            step_name="加载数据源",
+            status=StepStatus.RUNNING,
+            message="正在加载数据源...",
+            start_time=datetime.now()
+        )
+        
+        try:
+            data_sources = self.config['weekly_report'].get('data_sources', [])
+            if not data_sources:
+                raise ValueError("配置中未定义数据源")
+            
+            error_handling = self.config['weekly_report'].get('error_handling', {})
+            skip_invalid_rows = error_handling.get('skip_invalid_rows', False)
+            
+            total_rows = 0
+            for source in data_sources:
+                source_name = source.get('name')
+                source_id = source.get('id')
+                source_type = source.get('type', 'csv')
+                source_path_original = source.get('path')
+                source_path = self._resolve_path(source_path_original)
+                encoding = source.get('encoding', 'utf-8')
+                delimiter = source.get('delimiter', ',')
+                expected_columns = source.get('expected_columns', [])
+                
+                log_name = f"{source_name}" + (f" ({source_id})" if source_id else "")
+                
+                self._log_info(StepResult(
+                    step_name=f"加载数据源: {log_name}",
+                    status=StepStatus.RUNNING,
+                    message=f"正在从 {source_path} 加载数据..."
+                ))
+                
+                if not os.path.exists(source_path):
+                    raise FileNotFoundError(f"数据源文件不存在: {source_path}")
+                
+                if source_type.lower() == 'csv':
+                    if skip_invalid_rows:
+                        try:
+                            df = pd.read_csv(
+                                source_path,
+                                encoding=encoding,
+                                delimiter=delimiter,
+                                on_bad_lines='skip',
+                                keep_default_na=True
+                            )
+                        except Exception as e:
+                            self._log_warning(StepResult(
+                                step_name=f"加载数据源: {log_name}",
+                                status=StepStatus.RUNNING,
+                                message=f"遇到解析错误，尝试跳过坏行: {str(e)}"
+                            ))
+                            df = pd.read_csv(
+                                source_path,
+                                encoding=encoding,
+                                delimiter=delimiter,
+                                on_bad_lines='warn',
+                                keep_default_na=True
+                            )
+                    else:
+                        df = pd.read_csv(
+                            source_path,
+                            encoding=encoding,
+                            delimiter=delimiter,
+                            keep_default_na=True
+                        )
+                else:
+                    raise ValueError(f"不支持的数据源类型: {source_type}")
+                
+                if expected_columns:
+                    missing_cols = [col for col in expected_columns if col not in df.columns]
+                    if missing_cols:
+                        raise ValueError(f"数据源 {source_name} 缺少预期列: {missing_cols}")
+                
+                self.data_tables[source_name] = df
+                total_rows += len(df)
+                
+                self._log_info(StepResult(
+                    step_name=f"加载数据源: {log_name}",
+                    status=StepStatus.SUCCESS,
+                    message=f"成功加载 {len(df)} 行数据，列类型: {dict(df.dtypes)}",
+                    row_count=len(df)
+                ))
+            
+            step_result.status = StepStatus.SUCCESS
+            step_result.message = f"所有数据源加载成功，共 {total_rows} 行数据"
+            step_result.row_count = total_rows
+            step_result.end_time = datetime.now()
+            
+            self._log_info(step_result)
+            return True
+            
+        except Exception as e:
+            step_result.status = StepStatus.FAILED
+            step_result.message = f"数据源加载失败: {str(e)}"
+            step_result.error_details = traceback.format_exc()
+            step_result.end_time = datetime.now()
+            
+            self._log_error(step_result)
+            return False
+    
     def filter_by_date_range(self) -> bool:
         step_result = StepResult(
             step_name="按日期范围过滤数据",
@@ -271,12 +389,48 @@ class WeeklyReportGenerator:
             if date_field not in df.columns:
                 raise ValueError(f"日期字段 {date_field} 不存在于表 {source_table}")
             
-            df[date_field] = pd.to_datetime(df[date_field], errors='coerce')
+            self._log_info(StepResult(
+                step_name="按日期范围过滤数据",
+                status=StepStatus.RUNNING,
+                message=f"日期字段原始类型: {df[date_field].dtype}"
+            ))
             
-            mask = (df[date_field] >= self.week_start_date) & (df[date_field] <= self.week_end_date)
+            input_formats = ['%Y-%m-%d', '%Y/%m/%d', '%d-%m-%Y', '%Y%m%d']
+            
+            def parse_date_series(series):
+                parsed = pd.to_datetime(series, format='mixed', errors='coerce')
+                
+                na_mask = parsed.isna()
+                if na_mask.any():
+                    for fmt in input_formats:
+                        remaining = series[na_mask]
+                        if remaining.empty:
+                            break
+                        try:
+                            parsed.loc[na_mask] = pd.to_datetime(remaining, format=fmt, errors='coerce')
+                            na_mask = parsed.isna()
+                        except:
+                            continue
+                
+                return parsed
+            
+            df['_parsed_date'] = parse_date_series(df[date_field])
+            
+            na_count = df['_parsed_date'].isna().sum()
+            if na_count > 0:
+                self._log_warning(StepResult(
+                    step_name="按日期范围过滤数据",
+                    status=StepStatus.RUNNING,
+                    message=f"警告: {na_count} 行日期无法解析，将被过滤"
+                ))
+            
+            mask = (
+                (df['_parsed_date'] >= self.week_start_date) & 
+                (df['_parsed_date'] <= self.week_end_date)
+            )
+            
             filtered_df = df.loc[mask].copy()
-            
-            filtered_df[date_field] = filtered_df[date_field].dt.strftime('%Y-%m-%d')
+            filtered_df = filtered_df.drop(columns=['_parsed_date'])
             
             self.data_tables[source_table] = filtered_df
             
@@ -300,82 +454,6 @@ class WeeklyReportGenerator:
         except Exception as e:
             step_result.status = StepStatus.FAILED
             step_result.message = f"日期范围过滤失败: {str(e)}"
-            step_result.error_details = traceback.format_exc()
-            step_result.end_time = datetime.now()
-            
-            self._log_error(step_result)
-            return False
-    
-    def load_data_sources(self) -> bool:
-        step_result = StepResult(
-            step_name="加载数据源",
-            status=StepStatus.RUNNING,
-            message="正在加载数据源...",
-            start_time=datetime.now()
-        )
-        
-        try:
-            data_sources = self.config['weekly_report'].get('data_sources', [])
-            if not data_sources:
-                raise ValueError("配置中未定义数据源")
-            
-            total_rows = 0
-            for source in data_sources:
-                source_name = source.get('name')
-                source_id = source.get('id')
-                source_type = source.get('type', 'csv')
-                source_path = source.get('path')
-                encoding = source.get('encoding', 'utf-8')
-                delimiter = source.get('delimiter', ',')
-                expected_columns = source.get('expected_columns', [])
-                
-                log_name = f"{source_name}" + (f" ({source_id})" if source_id else "")
-                
-                self._log_info(StepResult(
-                    step_name=f"加载数据源: {log_name}",
-                    status=StepStatus.RUNNING,
-                    message=f"正在从 {source_path} 加载数据..."
-                ))
-                
-                if not os.path.exists(source_path):
-                    raise FileNotFoundError(f"数据源文件不存在: {source_path}")
-                
-                if source_type.lower() == 'csv':
-                    df = pd.read_csv(
-                        source_path,
-                        encoding=encoding,
-                        delimiter=delimiter,
-                        dtype=str
-                    )
-                else:
-                    raise ValueError(f"不支持的数据源类型: {source_type}")
-                
-                if expected_columns:
-                    missing_cols = [col for col in expected_columns if col not in df.columns]
-                    if missing_cols:
-                        raise ValueError(f"数据源 {source_name} 缺少预期列: {missing_cols}")
-                
-                self.data_tables[source_name] = df
-                total_rows += len(df)
-                
-                self._log_info(StepResult(
-                    step_name=f"加载数据源: {log_name}",
-                    status=StepStatus.SUCCESS,
-                    message=f"成功加载 {len(df)} 行数据",
-                    row_count=len(df)
-                ))
-            
-            step_result.status = StepStatus.SUCCESS
-            step_result.message = f"所有数据源加载成功，共 {total_rows} 行数据"
-            step_result.row_count = total_rows
-            step_result.end_time = datetime.now()
-            
-            self._log_info(step_result)
-            return True
-            
-        except Exception as e:
-            step_result.status = StepStatus.FAILED
-            step_result.message = f"数据源加载失败: {str(e)}"
             step_result.error_details = traceback.format_exc()
             step_result.end_time = datetime.now()
             
@@ -481,6 +559,7 @@ class WeeklyReportGenerator:
         elif action == 'format_date':
             input_formats = params.get('input_formats', ['%Y-%m-%d'])
             output_format = params.get('output_format', '%Y-%m-%d')
+            keep_datetime = params.get('keep_datetime', False)
             
             def parse_date(val):
                 if pd.isna(val) or val == '':
@@ -493,11 +572,14 @@ class WeeklyReportGenerator:
                 return pd.NaT
             
             df[field] = df[field].apply(parse_date)
-            df[field] = df[field].dt.strftime(output_format)
+            
+            if not keep_datetime:
+                df[field] = df[field].dt.strftime(output_format)
+            
             self._log_debug(StepResult(
                 step_name=f"数据清洗: {source_name}",
                 status=StepStatus.SUCCESS,
-                message=f"字段 {field}: 日期格式化为 {output_format}"
+                message=f"字段 {field}: 日期格式化为 {output_format}，保持datetime: {keep_datetime}"
             ))
             
         elif action == 'normalize_category':
@@ -572,6 +654,12 @@ class WeeklyReportGenerator:
                         continue
                     
                     if to_field != from_field:
+                        if to_field in df.columns and to_field not in columns_to_drop:
+                            self._log_warning(StepResult(
+                                step_name=f"字段映射: {source_name}",
+                                status=StepStatus.RUNNING,
+                                message=f"目标字段 {to_field} 已存在，将被覆盖"
+                            ))
                         new_columns[to_field] = df[from_field]
                         columns_to_drop.append(from_field)
                     
@@ -637,12 +725,13 @@ class WeeklyReportGenerator:
                 join_keys = join_config.get('join_keys', [])
                 output_table = join_config.get('output_table')
                 
-                suffixes_config = join_config.get('suffixes', {'left': '_x', 'right': '_y'})
-                left_suffix = suffixes_config.get('left', '_x')
-                right_suffix = suffixes_config.get('right', '_y')
+                suffixes_config = join_config.get('suffixes', {'left': '_left', 'right': '_right'})
+                left_suffix = suffixes_config.get('left', '_left')
+                right_suffix = suffixes_config.get('right', '_right')
                 
                 conflict_resolution = join_config.get('conflict_resolution', {'mode': 'keep_both'})
                 conflict_mode = conflict_resolution.get('mode', 'keep_both')
+                priority = conflict_resolution.get('priority', 'left')
                 
                 self._log_info(StepResult(
                     step_name=f"表间关联: {join_name}",
@@ -675,11 +764,6 @@ class WeeklyReportGenerator:
                     status=StepStatus.RUNNING,
                     message=f"关联键: 左表 {left_keys} -> 右表 {right_keys}"
                 ))
-                self._log_info(StepResult(
-                    step_name=f"表间关联: {join_name}",
-                    status=StepStatus.RUNNING,
-                    message=f"冲突处理模式: {conflict_mode}, 后缀: 左={left_suffix}, 右={right_suffix}"
-                ))
                 
                 left_cols = set(left_df.columns)
                 right_cols = set(right_df.columns)
@@ -690,17 +774,76 @@ class WeeklyReportGenerator:
                     self._log_warning(StepResult(
                         step_name=f"表间关联: {join_name}",
                         status=StepStatus.RUNNING,
-                        message=f"检测到冲突列: {conflicting_cols}，将使用后缀区分"
+                        message=f"检测到冲突列: {conflicting_cols}，冲突处理模式: {conflict_mode}"
                     ))
                 
-                result_df = pd.merge(
-                    left_df,
-                    right_df,
-                    left_on=left_keys,
-                    right_on=right_keys,
-                    how=join_type,
-                    suffixes=(left_suffix, right_suffix)
-                )
+                if conflict_mode == 'keep_both':
+                    self._log_info(StepResult(
+                        step_name=f"表间关联: {join_name}",
+                        status=StepStatus.RUNNING,
+                        message=f"保留冲突列: 使用后缀区分 - 左={left_suffix}, 右={right_suffix}"
+                    ))
+                    
+                    result_df = pd.merge(
+                        left_df,
+                        right_df,
+                        left_on=left_keys,
+                        right_on=right_keys,
+                        how=join_type,
+                        suffixes=(left_suffix, right_suffix)
+                    )
+                    
+                    for lk, rk in zip(left_keys, right_keys):
+                        if lk != rk and rk in result_df.columns:
+                            self._log_debug(StepResult(
+                                step_name=f"表间关联: {join_name}",
+                                status=StepStatus.SUCCESS,
+                                message=f"移除重复关联键列: {rk}"
+                            ))
+                            result_df = result_df.drop(columns=[rk])
+                
+                elif conflict_mode == 'left_priority':
+                    self._log_info(StepResult(
+                        step_name=f"表间关联: {join_name}",
+                        status=StepStatus.RUNNING,
+                        message=f"左表优先级: 冲突列保留左表值"
+                    ))
+                    
+                    right_df_to_merge = right_df.copy()
+                    for col in conflicting_cols:
+                        right_df_to_merge = right_df_to_merge.rename(columns={col: f"{col}{right_suffix}"})
+                    
+                    result_df = pd.merge(
+                        left_df,
+                        right_df_to_merge,
+                        left_on=left_keys,
+                        right_on=[rk if rk not in conflicting_cols else f"{rk}{right_suffix}" for rk in right_keys],
+                        how=join_type,
+                        suffixes=('', '')
+                    )
+                
+                elif conflict_mode == 'right_priority':
+                    self._log_info(StepResult(
+                        step_name=f"表间关联: {join_name}",
+                        status=StepStatus.RUNNING,
+                        message=f"右表优先级: 冲突列保留右表值"
+                    ))
+                    
+                    left_df_to_merge = left_df.copy()
+                    for col in conflicting_cols:
+                        left_df_to_merge = left_df_to_merge.rename(columns={col: f"{col}{left_suffix}"})
+                    
+                    result_df = pd.merge(
+                        left_df_to_merge,
+                        right_df,
+                        left_on=[lk if lk not in conflicting_cols else f"{lk}{left_suffix}" for lk in left_keys],
+                        right_on=right_keys,
+                        how=join_type,
+                        suffixes=('', '')
+                    )
+                
+                else:
+                    raise ValueError(f"不支持的冲突处理模式: {conflict_mode}")
                 
                 self.data_tables[output_table] = result_df
                 
@@ -911,6 +1054,7 @@ class WeeklyReportGenerator:
                 output_id = output_config.get('id')
                 source_type = output_config.get('source_type', 'metrics')
                 source_id = output_config.get('source_id')
+                source_name = output_config.get('source_name')
                 output_type = output_config.get('type', 'csv')
                 output_path_template = output_config.get('path')
                 encoding = output_config.get('encoding', 'utf-8')
@@ -926,18 +1070,31 @@ class WeeklyReportGenerator:
                     message=f"正在生成输出文件，源类型: {source_type}, 源ID: {source_id}"
                 ))
                 
-                df = self._get_source_data(source_type, source_id, log_name)
+                df = self._get_source_data(source_type, source_id, source_name, log_name)
                 
                 if include_week_info and self.week_info:
-                    for key, value in self.week_info.items():
+                    existing_cols = set(df.columns)
+                    conflicting_week_cols = [k for k in self.week_info.keys() if k in existing_cols]
+                    
+                    if conflicting_week_cols:
+                        self._log_warning(StepResult(
+                            step_name=f"生成输出: {log_name}",
+                            status=StepStatus.RUNNING,
+                            message=f"检测到周信息列名冲突: {conflicting_week_cols}，将覆盖这些列"
+                        ))
+                    
+                    for key, value in reversed(self.week_info.items()):
+                        if key in df.columns:
+                            df = df.drop(columns=[key])
                         df.insert(0, key, value)
+                    
                     self._log_debug(StepResult(
                         step_name=f"生成输出: {log_name}",
                         status=StepStatus.SUCCESS,
                         message=f"已添加周信息列: {list(self.week_info.keys())}"
                     ))
                 
-                output_path = output_path_template
+                output_path = self._resolve_path(output_path_template)
                 if include_timestamp:
                     base, ext = os.path.splitext(output_path)
                     output_path = f"{base}_{self.timestamp}{ext}"
@@ -979,29 +1136,45 @@ class WeeklyReportGenerator:
             self._log_error(step_result)
             return False
     
-    def _get_source_data(self, source_type: str, source_id: str, log_name: str) -> pd.DataFrame:
+    def _get_source_data(self, source_type: str, source_id: Optional[str], 
+                         source_name: Optional[str], log_name: str) -> pd.DataFrame:
         if source_type == 'metrics':
-            if source_id in self.metrics_id_map:
+            if source_id and source_id in self.metrics_id_map:
                 metrics_name = self.metrics_id_map[source_id]
                 if metrics_name in self.metrics_results:
                     return self.metrics_results[metrics_name].copy()
             
-            for name, df in self.metrics_results.items():
-                if name == source_id:
-                    return df.copy()
+            if source_name:
+                if source_name in self.metrics_results:
+                    return self.metrics_results[source_name].copy()
             
-            raise ValueError(f"未找到指标数据源: source_id={source_id}，可用ID: {list(self.metrics_id_map.keys())}，可用名称: {list(self.metrics_results.keys())}")
+            if source_id:
+                for name, df in self.metrics_results.items():
+                    if name == source_id:
+                        return df.copy()
+            
+            raise ValueError(
+                f"未找到指标数据源: source_id={source_id}, source_name={source_name}\n"
+                f"可用ID: {list(self.metrics_id_map.keys())}\n"
+                f"可用名称: {list(self.metrics_results.keys())}"
+            )
         
         elif source_type == 'table':
-            if source_id in self.data_tables:
+            if source_name and source_name in self.data_tables:
+                return self.data_tables[source_name].copy()
+            
+            if source_id and source_id in self.data_tables:
                 return self.data_tables[source_id].copy()
             
-            raise ValueError(f"未找到表数据源: source_id={source_id}，可用表: {list(self.data_tables.keys())}")
+            raise ValueError(
+                f"未找到表数据源: source_id={source_id}, source_name={source_name}\n"
+                f"可用表: {list(self.data_tables.keys())}"
+            )
         
         else:
             raise ValueError(f"不支持的源类型: {source_type}")
     
-    def run(self) -> Tuple[bool, Optional['WeeklyReportGenerator']]:
+    def run(self) -> Tuple[bool, 'WeeklyReportGenerator']:
         self._log_info(StepResult(
             step_name="周报生成流程",
             status=StepStatus.RUNNING,
@@ -1013,9 +1186,9 @@ class WeeklyReportGenerator:
             ("初始化日志系统", self.setup_logging),
             ("计算周范围", self.calculate_week_range),
             ("加载数据源", self.load_data_sources),
+            ("按日期范围过滤", self.filter_by_date_range),
             ("数据清洗", self.apply_cleansing_rules),
             ("字段映射", self.apply_field_mapping),
-            ("按日期范围过滤", self.filter_by_date_range),
             ("表间关联", self.perform_table_joins),
             ("指标计算", self.calculate_metrics),
             ("生成输出", self.generate_outputs),
@@ -1047,6 +1220,8 @@ class WeeklyReportGenerator:
                         status=StepStatus.SKIPPED,
                         message=f"步骤 {step_name} 失败，继续执行后续步骤"
                     ))
+        
+        self._has_run = True
         
         self._log_info(StepResult(
             step_name="周报生成流程",
@@ -1099,19 +1274,51 @@ class WeeklyReportValidator:
         validation_result = {
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'overall_status': 'PENDING',
-            'checks': []
+            'checks': [],
+            'summary': {
+                'pass_count': 0,
+                'fail_count': 0,
+                'skip_count': 0,
+                'error_count': 0
+            }
         }
         
         try:
-            with open(expected_results_path, 'r', encoding='utf-8') as f:
+            expected_path = self.generator._resolve_path(expected_results_path)
+            
+            with open(expected_path, 'r', encoding='utf-8') as f:
                 expected = yaml.safe_load(f)
             
-            for check_name, check_config in expected.get('validations', {}).items():
+            validations = expected.get('validations', {})
+            if not validations:
+                self.generator._log_warning(StepResult(
+                    step_name="验证器",
+                    status=StepStatus.SKIPPED,
+                    message="未定义验证项"
+                ))
+                validation_result['overall_status'] = 'SKIP'
+                return validation_result
+            
+            for check_name, check_config in validations.items():
                 check_result = self._perform_check(check_name, check_config)
                 validation_result['checks'].append(check_result)
+                
+                status = check_result.get('status', 'UNKNOWN')
+                if status == 'PASS':
+                    validation_result['summary']['pass_count'] += 1
+                elif status == 'FAIL':
+                    validation_result['summary']['fail_count'] += 1
+                elif status == 'SKIP':
+                    validation_result['summary']['skip_count'] += 1
+                elif status == 'ERROR':
+                    validation_result['summary']['error_count'] += 1
             
-            all_passed = all(c.get('status') == 'PASS' or c.get('status') == 'SKIP' for c in validation_result['checks'])
-            validation_result['overall_status'] = 'PASS' if all_passed else 'FAIL'
+            if validation_result['summary']['fail_count'] > 0 or validation_result['summary']['error_count'] > 0:
+                validation_result['overall_status'] = 'FAIL'
+            elif validation_result['summary']['skip_count'] > 0 and validation_result['summary']['pass_count'] == 0:
+                validation_result['overall_status'] = 'WARNING'
+            else:
+                validation_result['overall_status'] = 'PASS'
             
             return validation_result
             
@@ -1133,22 +1340,27 @@ class WeeklyReportValidator:
         try:
             check_type = check_config.get('type')
             source = check_config.get('source')
+            source_type = check_config.get('source_type', 'auto')
             field = check_config.get('field')
             expected_value = check_config.get('expected')
             
             df = None
-            if source in self.generator.metrics_results:
-                df = self.generator.metrics_results[source]
-            elif source in self.generator.metrics_id_map:
-                metrics_name = self.generator.metrics_id_map[source]
-                if metrics_name in self.generator.metrics_results:
-                    df = self.generator.metrics_results[metrics_name]
-            elif source in self.generator.data_tables:
-                df = self.generator.data_tables[source]
+            
+            if source_type == 'metrics' or source_type == 'auto':
+                if source in self.generator.metrics_results:
+                    df = self.generator.metrics_results[source]
+                elif source in self.generator.metrics_id_map:
+                    metrics_name = self.generator.metrics_id_map[source]
+                    if metrics_name in self.generator.metrics_results:
+                        df = self.generator.metrics_results[metrics_name]
+            
+            if df is None and (source_type == 'table' or source_type == 'auto'):
+                if source in self.generator.data_tables:
+                    df = self.generator.data_tables[source]
             
             if df is None:
                 result['status'] = 'SKIP'
-                result['message'] = f"数据源 {source} 不存在"
+                result['message'] = f"数据源 {source} 不存在（已搜索metrics和table）"
                 return result
             
             if check_type == 'row_count':
@@ -1166,7 +1378,7 @@ class WeeklyReportValidator:
             elif check_type == 'sum':
                 if field not in df.columns:
                     result['status'] = 'SKIP'
-                    result['message'] = f"字段 {field} 不存在"
+                    result['message'] = f"字段 {field} 不存在于表中，可用列: {list(df.columns)}"
                     return result
                 
                 actual = pd.to_numeric(df[field], errors='coerce').sum()
@@ -1183,24 +1395,38 @@ class WeeklyReportValidator:
             elif check_type == 'value':
                 if field not in df.columns:
                     result['status'] = 'SKIP'
-                    result['message'] = f"字段 {field} 不存在"
+                    result['message'] = f"字段 {field} 不存在于表中，可用列: {list(df.columns)}"
                     return result
                 
-                actual = df.iloc[0][field] if len(df) > 0 else None
+                row_index = check_config.get('row_index', 0)
+                if len(df) <= row_index:
+                    result['status'] = 'SKIP'
+                    result['message'] = f"行索引 {row_index} 超出范围，表只有 {len(df)} 行"
+                    return result
+                
+                actual = df.iloc[row_index][field]
                 result['expected'] = expected_value
                 result['actual'] = actual
                 
-                if actual == expected_value:
-                    result['status'] = 'PASS'
-                    result['message'] = f"值检查通过: {actual}"
+                if isinstance(expected_value, (int, float)) and isinstance(actual, (int, float)):
+                    if abs(actual - expected_value) < 0.01:
+                        result['status'] = 'PASS'
+                        result['message'] = f"值检查通过: {actual}"
+                    else:
+                        result['status'] = 'FAIL'
+                        result['message'] = f"值不匹配: 预期 {expected_value}, 实际 {actual}"
                 else:
-                    result['status'] = 'FAIL'
-                    result['message'] = f"值不匹配: 预期 {expected_value}, 实际 {actual}"
+                    if actual == expected_value:
+                        result['status'] = 'PASS'
+                        result['message'] = f"值检查通过: {actual}"
+                    else:
+                        result['status'] = 'FAIL'
+                        result['message'] = f"值不匹配: 预期 {expected_value}, 实际 {actual}"
             
             elif check_type == 'contains':
                 if field not in df.columns:
                     result['status'] = 'SKIP'
-                    result['message'] = f"字段 {field} 不存在"
+                    result['message'] = f"字段 {field} 不存在于表中，可用列: {list(df.columns)}"
                     return result
                 
                 contains = expected_value in df[field].values
@@ -1213,6 +1439,22 @@ class WeeklyReportValidator:
                 else:
                     result['status'] = 'FAIL'
                     result['message'] = f"包含检查失败: 未找到 {expected_value}"
+            
+            elif check_type == 'column_exists':
+                exists = field in df.columns
+                result['expected'] = f"列 {field} 存在"
+                result['actual'] = "存在" if exists else "不存在"
+                
+                if exists:
+                    result['status'] = 'PASS'
+                    result['message'] = f"列检查通过: {field} 存在"
+                else:
+                    result['status'] = 'FAIL'
+                    result['message'] = f"列检查失败: {field} 不存在，可用列: {list(df.columns)}"
+            
+            else:
+                result['status'] = 'SKIP'
+                result['message'] = f"不支持的检查类型: {check_type}"
             
             return result
             
@@ -1241,8 +1483,14 @@ def main():
   # 运行并自动验证结果
   python weekly_report_generator.py -m both
   
+  # 仅验证（需先运行过 -m run 或 -m both）
+  python weekly_report_generator.py -m validate
+  
   # 指定周一为周起始日
   python weekly_report_generator.py -w 1
+  
+  # 指定配置文件路径
+  python weekly_report_generator.py -c /path/to/config.yaml
         '''
     )
     
@@ -1292,7 +1540,9 @@ def main():
             validator = WeeklyReportValidator(generator_instance)
             validation_result = validator.validate_with_expected(args.expected)
             
+            summary = validation_result.get('summary', {})
             print(f"\n验证结果: {validation_result['overall_status']}")
+            print(f"  通过: {summary.get('pass_count', 0)}, 失败: {summary.get('fail_count', 0)}, 跳过: {summary.get('skip_count', 0)}, 错误: {summary.get('error_count', 0)}")
             print("-"*60)
             
             for check in validation_result.get('checks', []):
@@ -1306,6 +1556,9 @@ def main():
                 elif status == 'SKIP':
                     status_icon = '⚪'
                     status_color = '\033[93m'
+                elif status == 'ERROR':
+                    status_icon = '✕'
+                    status_color = '\033[95m'
                 else:
                     status_icon = '?'
                     status_color = '\033[0m'
@@ -1313,7 +1566,7 @@ def main():
                 reset_color = '\033[0m'
                 print(f"  {status_color}{status_icon}{reset_color} {check['check_name']}: {check['message']}")
                 
-                if status == 'FAIL' and check.get('expected') is not None:
+                if status in ['FAIL', 'ERROR'] and check.get('expected') is not None:
                     print(f"      预期: {check['expected']}")
                     print(f"      实际: {check['actual']}")
             
@@ -1322,28 +1575,38 @@ def main():
                 if validation_result.get('traceback'):
                     print(f"堆栈: {validation_result['traceback']}")
             
-            if validation_result['overall_status'] != 'PASS':
+            if validation_result['overall_status'] in ['FAIL', 'ERROR']:
                 print("\n验证失败！")
                 sys.exit(1)
-            
-            print("\n✓ 所有验证通过！")
+            elif validation_result['overall_status'] == 'WARNING':
+                print("\n验证有警告（所有检查跳过或无有效检查）")
+            else:
+                print("\n✓ 所有验证通过！")
     
     elif args.mode == 'validate':
-        success, generator_instance = generator.run()
-        if not success:
-            print("\n流程执行失败，无法进行验证。")
+        print("验证模式: 正在加载配置和数据...")
+        
+        if not generator.load_config():
+            print("错误: 无法加载配置文件")
+            sys.exit(1)
+        
+        if not generator.setup_logging():
+            print("错误: 无法初始化日志系统")
             sys.exit(1)
         
         print("\n开始验证结果...")
-        validator = WeeklyReportValidator(generator_instance)
+        validator = WeeklyReportValidator(generator)
         validation_result = validator.validate_with_expected(args.expected)
         
+        summary = validation_result.get('summary', {})
         print(f"\n验证结果: {validation_result['overall_status']}")
+        print(f"  通过: {summary.get('pass_count', 0)}, 失败: {summary.get('fail_count', 0)}, 跳过: {summary.get('skip_count', 0)}, 错误: {summary.get('error_count', 0)}")
+        
         for check in validation_result.get('checks', []):
-            status_icon = '✓' if check['status'] == 'PASS' else '✗' if check['status'] == 'FAIL' else '?'
+            status_icon = '✓' if check['status'] == 'PASS' else '✗' if check['status'] == 'FAIL' else '⚪' if check['status'] == 'SKIP' else '?'
             print(f"  {status_icon} {check['check_name']}: {check['message']}")
         
-        if validation_result['overall_status'] != 'PASS':
+        if validation_result['overall_status'] in ['FAIL', 'ERROR']:
             sys.exit(1)
     
     print("\n" + "="*60)
