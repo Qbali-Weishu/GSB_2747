@@ -1,0 +1,343 @@
+weekly_report:
+  name: "周报核心数据表生成"
+  version: "1.0"
+  
+  data_sources:
+    - name: "销售明细"
+      type: "csv"
+      path: "data/sales_details.csv"
+      encoding: "utf-8"
+      delimiter: ","
+      expected_columns:
+        - "订单编号"
+        - "订单日期"
+        - "客户名称"
+        - "产品名称"
+        - "销售数量"
+        - "销售金额"
+        - "渠道"
+      primary_key: "订单编号"
+    
+    - name: "库存明细"
+      type: "csv"
+      path: "data/inventory_details.csv"
+      encoding: "utf-8"
+      delimiter: ","
+      expected_columns:
+        - "产品编码"
+        - "产品名称"
+        - "库存数量"
+        - "安全库存"
+        - "库龄"
+      primary_key: "产品编码"
+    
+    - name: "客户信息"
+      type: "csv"
+      path: "data/customer_info.csv"
+      encoding: "utf-8"
+      delimiter: ","
+      expected_columns:
+        - "客户编号"
+        - "客户名称"
+        - "客户等级"
+        - "所在区域"
+        - "合作开始日期"
+      primary_key: "客户编号"
+
+  cleansing_rules:
+    - data_source: "销售明细"
+      rules:
+        - field: "订单日期"
+          action: "format_date"
+          params:
+            input_formats: ["%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y"]
+            output_format: "%Y-%m-%d"
+        
+        - field: "销售数量"
+          action: "fill_null"
+          params:
+            value: 0
+        
+        - field: "销售数量"
+          action: "ensure_numeric"
+          params:
+            type: "int"
+        
+        - field: "销售金额"
+          action: "fill_null"
+          params:
+            value: 0.0
+        
+        - field: "销售金额"
+          action: "ensure_numeric"
+          params:
+            type: "float"
+        
+        - field: "渠道"
+          action: "fill_null"
+          params:
+            value: "未知"
+        
+        - field: "渠道"
+          action: "normalize_category"
+          params:
+            mapping:
+              "线上": "线上渠道"
+              "Online": "线上渠道"
+              "线下": "线下渠道"
+              "Offline": "线下渠道"
+              "门店": "线下渠道"
+              "Store": "线下渠道"
+              "电商": "电商平台"
+              "E-commerce": "电商平台"
+            default: "其他"
+    
+    - data_source: "库存明细"
+      rules:
+        - field: "库存数量"
+          action: "fill_null"
+          params:
+            value: 0
+        
+        - field: "库存数量"
+          action: "ensure_numeric"
+          params:
+            type: "int"
+        
+        - field: "安全库存"
+          action: "fill_null"
+          params:
+            value: 10
+        
+        - field: "安全库存"
+          action: "ensure_numeric"
+          params:
+            type: "int"
+        
+        - field: "库龄"
+          action: "fill_null"
+          params:
+            value: 0
+        
+        - field: "库龄"
+          action: "ensure_numeric"
+          params:
+            type: "int"
+    
+    - data_source: "客户信息"
+      rules:
+        - field: "客户等级"
+          action: "fill_null"
+          params:
+            value: "普通"
+        
+        - field: "客户等级"
+          action: "normalize_category"
+          params:
+            mapping:
+              "VIP": "VIP客户"
+              "黄金": "黄金客户"
+              "Gold": "黄金客户"
+              "白金": "白金客户"
+              "Platinum": "白金客户"
+              "钻石": "钻石客户"
+              "Diamond": "钻石客户"
+            default: "普通客户"
+        
+        - field: "所在区域"
+          action: "fill_null"
+          params:
+            value: "未知"
+        
+        - field: "合作开始日期"
+          action: "format_date"
+          params:
+            input_formats: ["%Y-%m-%d", "%Y/%m/%d"]
+            output_format: "%Y-%m-%d"
+
+  field_mapping:
+    - source: "销售明细"
+      mappings:
+        - from: "订单编号"
+          to: "订单编号"
+        - from: "订单日期"
+          to: "订单日期"
+        - from: "客户名称"
+          to: "客户名称"
+        - from: "产品名称"
+          to: "产品名称"
+        - from: "销售数量"
+          to: "销售数量"
+        - from: "销售金额"
+          to: "销售金额"
+        - from: "渠道"
+          to: "销售渠道"
+    
+    - source: "库存明细"
+      mappings:
+        - from: "产品编码"
+          to: "产品编码"
+        - from: "产品名称"
+          to: "产品名称"
+        - from: "库存数量"
+          to: "库存数量"
+        - from: "安全库存"
+          to: "安全库存"
+        - from: "库龄"
+          to: "库龄"
+    
+    - source: "客户信息"
+      mappings:
+        - from: "客户编号"
+          to: "客户编号"
+        - from: "客户名称"
+          to: "客户名称"
+        - from: "客户等级"
+          to: "客户等级"
+        - from: "所在区域"
+          to: "所在区域"
+        - from: "合作开始日期"
+          to: "合作开始日期"
+
+  table_joins:
+    - name: "销售与客户关联"
+      left_table: "销售明细"
+      right_table: "客户信息"
+      join_type: "left"
+      join_keys:
+        - left: "客户名称"
+          right: "客户名称"
+      output_table: "销售客户关联表"
+    
+    - name: "销售与库存关联"
+      left_table: "销售客户关联表"
+      right_table: "库存明细"
+      join_type: "left"
+      join_keys:
+        - left: "产品名称"
+          right: "产品名称"
+      output_table: "完整关联表"
+
+  metrics_calculation:
+    - name: "基础指标"
+      source_table: "完整关联表"
+      metrics:
+        - name: "订单总数"
+          type: "count"
+          field: "订单编号"
+        
+        - name: "销售总数量"
+          type: "sum"
+          field: "销售数量"
+        
+        - name: "销售总金额"
+          type: "sum"
+          field: "销售金额"
+        
+        - name: "平均客单价"
+          type: "avg"
+          field: "销售金额"
+        
+        - name: "最大销售金额"
+          type: "max"
+          field: "销售金额"
+        
+        - name: "最小销售金额"
+          type: "min"
+          field: "销售金额"
+    
+    - name: "按渠道分组"
+      source_table: "完整关联表"
+      group_by: ["销售渠道"]
+      metrics:
+        - name: "渠道订单数"
+          type: "count"
+          field: "订单编号"
+        
+        - name: "渠道销售数量"
+          type: "sum"
+          field: "销售数量"
+        
+        - name: "渠道销售金额"
+          type: "sum"
+          field: "销售金额"
+        
+        - name: "渠道平均金额"
+          type: "avg"
+          field: "销售金额"
+    
+    - name: "按客户等级分组"
+      source_table: "完整关联表"
+      group_by: ["客户等级"]
+      metrics:
+        - name: "等级客户数"
+          type: "count_distinct"
+          field: "客户名称"
+        
+        - name: "等级销售数量"
+          type: "sum"
+          field: "销售数量"
+        
+        - name: "等级销售金额"
+          type: "sum"
+          field: "销售金额"
+    
+    - name: "按区域分组"
+      source_table: "完整关联表"
+      group_by: ["所在区域"]
+      metrics:
+        - name: "区域订单数"
+          type: "count"
+          field: "订单编号"
+        
+        - name: "区域销售金额"
+          type: "sum"
+          field: "销售金额"
+
+  output:
+    - name: "周报核心指标汇总表"
+      type: "csv"
+      path: "output/weekly_summary_metrics.csv"
+      encoding: "utf-8"
+      delimiter: ","
+      include_timestamp: true
+    
+    - name: "按渠道分析表"
+      type: "csv"
+      path: "output/channel_analysis.csv"
+      encoding: "utf-8"
+      delimiter: ","
+      include_timestamp: false
+    
+    - name: "按客户等级分析表"
+      type: "csv"
+      path: "output/customer_level_analysis.csv"
+      encoding: "utf-8"
+      delimiter: ","
+      include_timestamp: false
+    
+    - name: "按区域分析表"
+      type: "csv"
+      path: "output/region_analysis.csv"
+      encoding: "utf-8"
+      delimiter: ","
+      include_timestamp: false
+    
+    - name: "完整关联明细数据"
+      type: "csv"
+      path: "output/full_joined_data.csv"
+      encoding: "utf-8"
+      delimiter: ","
+      include_timestamp: false
+
+  logging:
+    level: "INFO"
+    file: "logs/weekly_report_{timestamp}.log"
+    format: "%(asctime)s - %(levelname)s - %(step)s - %(message)s"
+    console_output: true
+
+  error_handling:
+    stop_on_error: true
+    skip_invalid_rows: false
+    max_retries: 3
+    retry_delay: 5
