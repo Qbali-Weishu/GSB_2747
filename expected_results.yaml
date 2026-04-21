@@ -1,0 +1,54 @@
+validations:
+  销售数据行数检查:
+    type: row_count
+    source: 销售明细
+    expected: 10
+  
+  库存数据行数检查:
+    type: row_count
+    source: 库存明细
+    expected: 6
+  
+  客户信息行数检查:
+    type: row_count
+    source: 客户信息
+    expected: 8
+  
+  订单总数检查:
+    type: value
+    source: 基础指标
+    field: 订单总数
+    expected: 10
+  
+  销售总数量检查:
+    type: sum
+    source: 基础指标
+    field: 销售总数量
+    expected: 78
+  
+  销售总金额检查:
+    type: sum
+    source: 基础指标
+    field: 销售总金额
+    expected: 82950.0
+  
+  线上渠道存在检查:
+    type: contains
+    source: 按渠道分组
+    field: 销售渠道
+    expected: 线上渠道
+  
+  完整关联表行数检查:
+    type: row_count
+    source: 完整关联表
+    expected: 10
+  
+  客户等级分组数检查:
+    type: row_count
+    source: 按客户等级分组
+    expected: 5
+  
+  区域分组数检查:
+    type: row_count
+    source: 按区域分组
+    expected: 5
