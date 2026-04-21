@@ -1,9 +1,18 @@
 weekly_report:
   name: "周报核心数据表生成"
-  version: "1.0"
+  version: "1.1"
   
+  report_date: "2025-04-18"
+  week_start_day: 1
+  
+  date_range:
+    enabled: true
+    date_field: "订单日期"
+    source_table: "销售明细"
+
   data_sources:
     - name: "销售明细"
+      id: "sales"
       type: "csv"
       path: "data/sales_details.csv"
       encoding: "utf-8"
@@ -19,6 +28,7 @@ weekly_report:
       primary_key: "订单编号"
     
     - name: "库存明细"
+      id: "inventory"
       type: "csv"
       path: "data/inventory_details.csv"
       encoding: "utf-8"
@@ -32,6 +42,7 @@ weekly_report:
       primary_key: "产品编码"
     
     - name: "客户信息"
+      id: "customer"
       type: "csv"
       path: "data/customer_info.csv"
       encoding: "utf-8"
@@ -207,6 +218,11 @@ weekly_report:
       join_keys:
         - left: "客户名称"
           right: "客户名称"
+      suffixes:
+        left: "_sales"
+        right: "_customer"
+      conflict_resolution:
+        mode: "keep_both"
       output_table: "销售客户关联表"
     
     - name: "销售与库存关联"
@@ -216,10 +232,16 @@ weekly_report:
       join_keys:
         - left: "产品名称"
           right: "产品名称"
+      suffixes:
+        left: "_sc"
+        right: "_inventory"
+      conflict_resolution:
+        mode: "keep_both"
       output_table: "完整关联表"
 
   metrics_calculation:
     - name: "基础指标"
+      id: "basic_metrics"
       source_table: "完整关联表"
       metrics:
         - name: "订单总数"
@@ -247,6 +269,7 @@ weekly_report:
           field: "销售金额"
     
     - name: "按渠道分组"
+      id: "channel_metrics"
       source_table: "完整关联表"
       group_by: ["销售渠道"]
       metrics:
@@ -267,6 +290,7 @@ weekly_report:
           field: "销售金额"
     
     - name: "按客户等级分组"
+      id: "customer_level_metrics"
       source_table: "完整关联表"
       group_by: ["客户等级"]
       metrics:
@@ -283,6 +307,7 @@ weekly_report:
           field: "销售金额"
     
     - name: "按区域分组"
+      id: "region_metrics"
       source_table: "完整关联表"
       group_by: ["所在区域"]
       metrics:
@@ -296,13 +321,20 @@ weekly_report:
 
   output:
     - name: "周报核心指标汇总表"
+      id: "weekly_summary"
+      source_type: "metrics"
+      source_id: "basic_metrics"
       type: "csv"
       path: "output/weekly_summary_metrics.csv"
       encoding: "utf-8"
       delimiter: ","
       include_timestamp: true
+      include_week_info: true
     
     - name: "按渠道分析表"
+      id: "channel_analysis"
+      source_type: "metrics"
+      source_id: "channel_metrics"
       type: "csv"
       path: "output/channel_analysis.csv"
       encoding: "utf-8"
@@ -310,6 +342,9 @@ weekly_report:
       include_timestamp: false
     
     - name: "按客户等级分析表"
+      id: "customer_level_analysis"
+      source_type: "metrics"
+      source_id: "customer_level_metrics"
       type: "csv"
       path: "output/customer_level_analysis.csv"
       encoding: "utf-8"
@@ -317,6 +352,9 @@ weekly_report:
       include_timestamp: false
     
     - name: "按区域分析表"
+      id: "region_analysis"
+      source_type: "metrics"
+      source_id: "region_metrics"
       type: "csv"
       path: "output/region_analysis.csv"
       encoding: "utf-8"
@@ -324,6 +362,9 @@ weekly_report:
       include_timestamp: false
     
     - name: "完整关联明细数据"
+      id: "full_joined_data"
+      source_type: "table"
+      source_id: "完整关联表"
       type: "csv"
       path: "output/full_joined_data.csv"
       encoding: "utf-8"
@@ -333,11 +374,9 @@ weekly_report:
   logging:
     level: "INFO"
     file: "logs/weekly_report_{timestamp}.log"
-    format: "%(asctime)s - %(levelname)s - %(step)s - %(message)s"
+    format: "%(asctime)s - %(levelname)s - [%(step)s] - %(message)s"
     console_output: true
 
   error_handling:
     stop_on_error: true
     skip_invalid_rows: false
-    max_retries: 3
-    retry_delay: 5
