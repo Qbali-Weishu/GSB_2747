@@ -9,12 +9,13 @@ import os
 import sys
 import logging
 import traceback
+import pickle
+import gzip
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from enum import Enum
 import argparse
-import json
 
 import pandas as pd
 import numpy as np
@@ -44,6 +45,15 @@ class StepResult:
         if self.start_time and self.end_time:
             return (self.end_time - self.start_time).total_seconds()
         return None
+    
+    def to_dict(self) -> Dict:
+        return {
+            'step_name': self.step_name,
+            'status': self.status.value,
+            'message': self.message,
+            'row_count': self.row_count,
+            'duration': self.duration
+        }
 
 
 class StepFilter(logging.Filter):
@@ -51,6 +61,86 @@ class StepFilter(logging.Filter):
         if not hasattr(record, 'step'):
             record.step = '未指定'
         return True
+
+
+class ResultsSerializer:
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
+        self.metadata_file = os.path.join(output_dir, 'run_metadata.yaml')
+        self.data_file = os.path.join(output_dir, 'run_data.pkl.gz')
+    
+    def save(self, generator: 'WeeklyReportGenerator') -> bool:
+        try:
+            if not os.path.exists(self.output_dir):
+                os.makedirs(self.output_dir, exist_ok=True)
+            
+            metadata = {
+                'timestamp': generator.timestamp,
+                'week_info': generator.week_info,
+                'week_start_date': generator.week_start_date.strftime('%Y-%m-%d') if generator.week_start_date else None,
+                'week_end_date': generator.week_end_date.strftime('%Y-%m-%d') if generator.week_end_date else None,
+                'execution_results': [r.to_dict() for r in generator.execution_results],
+                'metrics_id_map': generator.metrics_id_map,
+                'data_tables_info': {name: {'columns': list(df.columns), 'row_count': len(df)} 
+                                    for name, df in generator.data_tables.items()},
+                'metrics_results_info': {name: {'columns': list(df.columns), 'row_count': len(df)} 
+                                        for name, df in generator.metrics_results.items()},
+                'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+            
+            with open(self.metadata_file, 'w', encoding='utf-8') as f:
+                yaml.dump(metadata, f, allow_unicode=True, default_flow_style=False)
+            
+            data_to_save = {
+                'data_tables': generator.data_tables,
+                'metrics_results': generator.metrics_results,
+                'metrics_id_map': generator.metrics_id_map,
+                'week_info': generator.week_info,
+                'timestamp': generator.timestamp
+            }
+            
+            with gzip.open(self.data_file, 'wb') as f:
+                pickle.dump(data_to_save, f)
+            
+            return True
+            
+        except Exception as e:
+            print(f"保存运行结果失败: {str(e)}")
+            return False
+    
+    def load(self, generator: 'WeeklyReportGenerator') -> bool:
+        try:
+            if not os.path.exists(self.metadata_file):
+                print(f"元数据文件不存在: {self.metadata_file}")
+                return False
+            
+            if not os.path.exists(self.data_file):
+                print(f"数据文件不存在: {self.data_file}")
+                return False
+            
+            with open(self.metadata_file, 'r', encoding='utf-8') as f:
+                metadata = yaml.safe_load(f)
+            
+            with gzip.open(self.data_file, 'rb') as f:
+                loaded_data = pickle.load(f)
+            
+            generator.data_tables = loaded_data.get('data_tables', {})
+            generator.metrics_results = loaded_data.get('metrics_results', {})
+            generator.metrics_id_map = loaded_data.get('metrics_id_map', {})
+            generator.week_info = loaded_data.get('week_info', {})
+            generator.timestamp = loaded_data.get('timestamp', generator.timestamp)
+            
+            if metadata.get('week_start_date'):
+                generator.week_start_date = datetime.strptime(metadata['week_start_date'], '%Y-%m-%d')
+            if metadata.get('week_end_date'):
+                generator.week_end_date = datetime.strptime(metadata['week_end_date'], '%Y-%m-%d')
+            
+            return True
+            
+        except Exception as e:
+            print(f"加载运行结果失败: {str(e)}")
+            traceback.print_exc()
+            return False
 
 
 class WeeklyReportGenerator:
@@ -89,6 +179,9 @@ class WeeklyReportGenerator:
             return path
         return os.path.abspath(os.path.join(self.config_dir, path))
     
+    def _get_results_dir(self) -> str:
+        return self._resolve_path('output/last_run')
+    
     def load_config(self) -> bool:
         step_result = StepResult(
             step_name="加载配置文件",
@@ -103,6 +196,15 @@ class WeeklyReportGenerator:
             
             if not self.config or 'weekly_report' not in self.config:
                 raise ValueError("配置文件格式错误，缺少 weekly_report 节点")
+            
+            wr_config = self.config['weekly_report']
+            if 'date_range' in wr_config:
+                if 'auto_detect_week' in wr_config['date_range']:
+                    self._log_warning(StepResult(
+                        step_name="配置检查",
+                        status=StepStatus.SKIPPED,
+                        message="警告: auto_detect_week 配置已废弃，将被忽略"
+                    ))
             
             self._is_loaded = True
             
@@ -395,28 +497,9 @@ class WeeklyReportGenerator:
                 message=f"日期字段原始类型: {df[date_field].dtype}"
             ))
             
-            input_formats = ['%Y-%m-%d', '%Y/%m/%d', '%d-%m-%Y', '%Y%m%d']
+            parsed_dates = pd.to_datetime(df[date_field], errors='coerce')
+            na_count = parsed_dates.isna().sum()
             
-            def parse_date_series(series):
-                parsed = pd.to_datetime(series, format='mixed', errors='coerce')
-                
-                na_mask = parsed.isna()
-                if na_mask.any():
-                    for fmt in input_formats:
-                        remaining = series[na_mask]
-                        if remaining.empty:
-                            break
-                        try:
-                            parsed.loc[na_mask] = pd.to_datetime(remaining, format=fmt, errors='coerce')
-                            na_mask = parsed.isna()
-                        except:
-                            continue
-                
-                return parsed
-            
-            df['_parsed_date'] = parse_date_series(df[date_field])
-            
-            na_count = df['_parsed_date'].isna().sum()
             if na_count > 0:
                 self._log_warning(StepResult(
                     step_name="按日期范围过滤数据",
@@ -424,13 +507,25 @@ class WeeklyReportGenerator:
                     message=f"警告: {na_count} 行日期无法解析，将被过滤"
                 ))
             
+            df['_parsed_date'] = parsed_dates
+            
             mask = (
                 (df['_parsed_date'] >= self.week_start_date) & 
                 (df['_parsed_date'] <= self.week_end_date)
             )
             
             filtered_df = df.loc[mask].copy()
-            filtered_df = filtered_df.drop(columns=['_parsed_date'])
+            
+            self._log_info(StepResult(
+                step_name="按日期范围过滤数据",
+                status=StepStatus.RUNNING,
+                message=f"保持日期列为 datetime 类型，不转字符串"
+            ))
+            
+            if '_parsed_date' in filtered_df.columns:
+                if date_field in filtered_df.columns:
+                    filtered_df[date_field] = filtered_df['_parsed_date']
+                filtered_df = filtered_df.drop(columns=['_parsed_date'])
             
             self.data_tables[source_table] = filtered_df
             
@@ -571,16 +666,22 @@ class WeeklyReportGenerator:
                         continue
                 return pd.NaT
             
-            df[field] = df[field].apply(parse_date)
+            if not pd.api.types.is_datetime64_any_dtype(df[field]):
+                df[field] = df[field].apply(parse_date)
             
             if not keep_datetime:
                 df[field] = df[field].dt.strftime(output_format)
-            
-            self._log_debug(StepResult(
-                step_name=f"数据清洗: {source_name}",
-                status=StepStatus.SUCCESS,
-                message=f"字段 {field}: 日期格式化为 {output_format}，保持datetime: {keep_datetime}"
-            ))
+                self._log_debug(StepResult(
+                    step_name=f"数据清洗: {source_name}",
+                    status=StepStatus.SUCCESS,
+                    message=f"字段 {field}: 日期格式化为字符串 {output_format}"
+                ))
+            else:
+                self._log_debug(StepResult(
+                    step_name=f"数据清洗: {source_name}",
+                    status=StepStatus.SUCCESS,
+                    message=f"字段 {field}: 保持 datetime 类型"
+                ))
             
         elif action == 'normalize_category':
             mapping = params.get('mapping', {})
@@ -731,7 +832,6 @@ class WeeklyReportGenerator:
                 
                 conflict_resolution = join_config.get('conflict_resolution', {'mode': 'keep_both'})
                 conflict_mode = conflict_resolution.get('mode', 'keep_both')
-                priority = conflict_resolution.get('priority', 'left')
                 
                 self._log_info(StepResult(
                     step_name=f"表间关联: {join_name}",
@@ -767,21 +867,35 @@ class WeeklyReportGenerator:
                 
                 left_cols = set(left_df.columns)
                 right_cols = set(right_df.columns)
-                join_keys_set = set(left_keys + right_keys)
-                conflicting_cols = (left_cols & right_cols) - join_keys_set
+                
+                same_join_keys = {lk for lk, rk in zip(left_keys, right_keys) if lk == rk}
+                
+                all_cols = left_cols & right_cols
+                conflicting_cols = all_cols - same_join_keys
                 
                 if conflicting_cols:
                     self._log_warning(StepResult(
                         step_name=f"表间关联: {join_name}",
                         status=StepStatus.RUNNING,
-                        message=f"检测到冲突列: {conflicting_cols}，冲突处理模式: {conflict_mode}"
+                        message=f"检测到冲突列: {conflicting_cols}（同名列但不是同一关联键）"
+                    ))
+                    self._log_warning(StepResult(
+                        step_name=f"表间关联: {join_name}",
+                        status=StepStatus.RUNNING,
+                        message=f"同一关联键: {same_join_keys}（这些不会冲突，merge后只保留一列）"
+                    ))
+                else:
+                    self._log_info(StepResult(
+                        step_name=f"表间关联: {join_name}",
+                        status=StepStatus.RUNNING,
+                        message=f"无冲突列，所有同名列都是关联键: {same_join_keys}"
                     ))
                 
                 if conflict_mode == 'keep_both':
                     self._log_info(StepResult(
                         step_name=f"表间关联: {join_name}",
                         status=StepStatus.RUNNING,
-                        message=f"保留冲突列: 使用后缀区分 - 左={left_suffix}, 右={right_suffix}"
+                        message=f"模式: keep_both - 保留冲突列，使用后缀区分 - 左={left_suffix}, 右={right_suffix}"
                     ))
                     
                     result_df = pd.merge(
@@ -798,26 +912,45 @@ class WeeklyReportGenerator:
                             self._log_debug(StepResult(
                                 step_name=f"表间关联: {join_name}",
                                 status=StepStatus.SUCCESS,
-                                message=f"移除重复关联键列: {rk}"
+                                message=f"保留右表关联键列: {rk}（与左表关联键 {lk} 不同名）"
                             ))
-                            result_df = result_df.drop(columns=[rk])
                 
                 elif conflict_mode == 'left_priority':
                     self._log_info(StepResult(
                         step_name=f"表间关联: {join_name}",
                         status=StepStatus.RUNNING,
-                        message=f"左表优先级: 冲突列保留左表值"
+                        message=f"模式: left_priority - 冲突列保留左表值，右表冲突列重命名为 {right_suffix} 后缀"
                     ))
                     
                     right_df_to_merge = right_df.copy()
+                    
+                    right_keys_original = right_keys.copy()
+                    
                     for col in conflicting_cols:
-                        right_df_to_merge = right_df_to_merge.rename(columns={col: f"{col}{right_suffix}"})
+                        if col in right_df_to_merge.columns:
+                            new_col_name = f"{col}{right_suffix}"
+                            self._log_debug(StepResult(
+                                step_name=f"表间关联: {join_name}",
+                                status=StepStatus.RUNNING,
+                                message=f"右表冲突列重命名: {col} -> {new_col_name}"
+                            ))
+                            right_df_to_merge = right_df_to_merge.rename(columns={col: new_col_name})
+                            
+                            if col in right_keys:
+                                idx = right_keys.index(col)
+                                right_keys[idx] = new_col_name
+                    
+                    self._log_debug(StepResult(
+                        step_name=f"表间关联: {join_name}",
+                        status=StepStatus.RUNNING,
+                        message=f"调整后关联键: 左表 {left_keys} -> 右表 {right_keys}"
+                    ))
                     
                     result_df = pd.merge(
                         left_df,
                         right_df_to_merge,
                         left_on=left_keys,
-                        right_on=[rk if rk not in conflicting_cols else f"{rk}{right_suffix}" for rk in right_keys],
+                        right_on=right_keys,
                         how=join_type,
                         suffixes=('', '')
                     )
@@ -826,17 +959,37 @@ class WeeklyReportGenerator:
                     self._log_info(StepResult(
                         step_name=f"表间关联: {join_name}",
                         status=StepStatus.RUNNING,
-                        message=f"右表优先级: 冲突列保留右表值"
+                        message=f"模式: right_priority - 冲突列保留右表值，左表冲突列重命名为 {left_suffix} 后缀"
                     ))
                     
                     left_df_to_merge = left_df.copy()
+                    
+                    left_keys_original = left_keys.copy()
+                    
                     for col in conflicting_cols:
-                        left_df_to_merge = left_df_to_merge.rename(columns={col: f"{col}{left_suffix}"})
+                        if col in left_df_to_merge.columns:
+                            new_col_name = f"{col}{left_suffix}"
+                            self._log_debug(StepResult(
+                                step_name=f"表间关联: {join_name}",
+                                status=StepStatus.RUNNING,
+                                message=f"左表冲突列重命名: {col} -> {new_col_name}"
+                            ))
+                            left_df_to_merge = left_df_to_merge.rename(columns={col: new_col_name})
+                            
+                            if col in left_keys:
+                                idx = left_keys.index(col)
+                                left_keys[idx] = new_col_name
+                    
+                    self._log_debug(StepResult(
+                        step_name=f"表间关联: {join_name}",
+                        status=StepStatus.RUNNING,
+                        message=f"调整后关联键: 左表 {left_keys} -> 右表 {right_keys}"
+                    ))
                     
                     result_df = pd.merge(
                         left_df_to_merge,
                         right_df,
-                        left_on=[lk if lk not in conflicting_cols else f"{lk}{left_suffix}" for lk in left_keys],
+                        left_on=left_keys,
                         right_on=right_keys,
                         how=join_type,
                         suffixes=('', '')
@@ -1174,6 +1327,43 @@ class WeeklyReportGenerator:
         else:
             raise ValueError(f"不支持的源类型: {source_type}")
     
+    def save_results(self) -> bool:
+        step_result = StepResult(
+            step_name="保存运行结果",
+            status=StepStatus.RUNNING,
+            message="正在保存运行结果...",
+            start_time=datetime.now()
+        )
+        
+        try:
+            serializer = ResultsSerializer(self._get_results_dir())
+            success = serializer.save(self)
+            
+            if success:
+                step_result.status = StepStatus.SUCCESS
+                step_result.message = f"运行结果已保存到: {self._get_results_dir()}"
+            else:
+                step_result.status = StepStatus.FAILED
+                step_result.message = "保存运行结果失败"
+            
+            step_result.end_time = datetime.now()
+            self._log_info(step_result)
+            return success
+            
+        except Exception as e:
+            step_result.status = StepStatus.FAILED
+            step_result.message = f"保存运行结果失败: {str(e)}"
+            step_result.error_details = traceback.format_exc()
+            step_result.end_time = datetime.now()
+            self._log_error(step_result)
+            return False
+    
+    def load_results(self) -> bool:
+        print(f"正在从 {self._get_results_dir()} 加载之前的运行结果...")
+        
+        serializer = ResultsSerializer(self._get_results_dir())
+        return serializer.load(self)
+    
     def run(self) -> Tuple[bool, 'WeeklyReportGenerator']:
         self._log_info(StepResult(
             step_name="周报生成流程",
@@ -1192,6 +1382,7 @@ class WeeklyReportGenerator:
             ("表间关联", self.perform_table_joins),
             ("指标计算", self.calculate_metrics),
             ("生成输出", self.generate_outputs),
+            ("保存运行结果", self.save_results),
         ]
         
         for step_name, step_func in steps:
@@ -1268,7 +1459,6 @@ class WeeklyReportGenerator:
 class WeeklyReportValidator:
     def __init__(self, generator: WeeklyReportGenerator):
         self.generator = generator
-        self.validation_results = []
     
     def validate_with_expected(self, expected_results_path: str) -> Dict[str, Any]:
         validation_result = {
@@ -1291,11 +1481,7 @@ class WeeklyReportValidator:
             
             validations = expected.get('validations', {})
             if not validations:
-                self.generator._log_warning(StepResult(
-                    step_name="验证器",
-                    status=StepStatus.SKIPPED,
-                    message="未定义验证项"
-                ))
+                print("警告: 未定义验证项")
                 validation_result['overall_status'] = 'SKIP'
                 return validation_result
             
@@ -1471,7 +1657,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 使用示例:
-  # 使用默认配置运行
+  # 使用默认配置运行并保存结果
   python weekly_report_generator.py
   
   # 指定报告日期（自动计算该日期所在周）
@@ -1483,7 +1669,7 @@ def main():
   # 运行并自动验证结果
   python weekly_report_generator.py -m both
   
-  # 仅验证（需先运行过 -m run 或 -m both）
+  # 仅验证（读取上次运行的结果）
   python weekly_report_generator.py -m validate
   
   # 指定周一为周起始日
@@ -1497,7 +1683,7 @@ def main():
     parser.add_argument('-c', '--config', default='config.yaml', 
                        help='配置文件路径 (默认: config.yaml)')
     parser.add_argument('-m', '--mode', choices=['run', 'validate', 'both'], default='run',
-                       help='运行模式: run(仅运行), validate(仅验证), both(运行并自动验证) (默认: run)')
+                       help='运行模式: run(运行并保存结果), validate(仅验证，读取上次结果), both(运行并验证) (默认: run)')
     parser.add_argument('-e', '--expected', default='expected_results.yaml', 
                        help='预期结果验证文件路径 (默认: expected_results.yaml)')
     
@@ -1525,88 +1711,111 @@ def main():
         custom_end_date=args.end_date
     )
     
-    if args.mode in ['run', 'both']:
+    if args.mode == 'run':
         success, generator_instance = generator.run()
         
         if not success:
             print("\n流程执行失败，请检查日志获取详细信息。")
             sys.exit(1)
         
-        if args.mode == 'both':
-            print("\n" + "="*60)
-            print("开始自动验证结果...")
-            print("="*60)
-            
-            validator = WeeklyReportValidator(generator_instance)
-            validation_result = validator.validate_with_expected(args.expected)
-            
-            summary = validation_result.get('summary', {})
-            print(f"\n验证结果: {validation_result['overall_status']}")
-            print(f"  通过: {summary.get('pass_count', 0)}, 失败: {summary.get('fail_count', 0)}, 跳过: {summary.get('skip_count', 0)}, 错误: {summary.get('error_count', 0)}")
-            print("-"*60)
-            
-            for check in validation_result.get('checks', []):
-                status = check.get('status', 'UNKNOWN')
-                if status == 'PASS':
-                    status_icon = '✓'
-                    status_color = '\033[92m'
-                elif status == 'FAIL':
-                    status_icon = '✗'
-                    status_color = '\033[91m'
-                elif status == 'SKIP':
-                    status_icon = '⚪'
-                    status_color = '\033[93m'
-                elif status == 'ERROR':
-                    status_icon = '✕'
-                    status_color = '\033[95m'
-                else:
-                    status_icon = '?'
-                    status_color = '\033[0m'
-                
-                reset_color = '\033[0m'
-                print(f"  {status_color}{status_icon}{reset_color} {check['check_name']}: {check['message']}")
-                
-                if status in ['FAIL', 'ERROR'] and check.get('expected') is not None:
-                    print(f"      预期: {check['expected']}")
-                    print(f"      实际: {check['actual']}")
-            
-            if validation_result.get('error'):
-                print(f"\n错误详情: {validation_result['error']}")
-                if validation_result.get('traceback'):
-                    print(f"堆栈: {validation_result['traceback']}")
-            
-            if validation_result['overall_status'] in ['FAIL', 'ERROR']:
-                print("\n验证失败！")
-                sys.exit(1)
-            elif validation_result['overall_status'] == 'WARNING':
-                print("\n验证有警告（所有检查跳过或无有效检查）")
+        print(f"\n运行完成！结果已保存到: {generator._get_results_dir()}")
+        print("\n如需验证结果，可运行: python weekly_report_generator.py -m validate")
+    
+    elif args.mode == 'both':
+        success, generator_instance = generator.run()
+        
+        if not success:
+            print("\n流程执行失败，请检查日志获取详细信息。")
+            sys.exit(1)
+        
+        print("\n" + "="*60)
+        print("开始自动验证结果...")
+        print("="*60)
+        
+        validator = WeeklyReportValidator(generator_instance)
+        validation_result = validator.validate_with_expected(args.expected)
+        
+        summary = validation_result.get('summary', {})
+        print(f"\n验证结果: {validation_result['overall_status']}")
+        print(f"  通过: {summary.get('pass_count', 0)}, 失败: {summary.get('fail_count', 0)}, 跳过: {summary.get('skip_count', 0)}, 错误: {summary.get('error_count', 0)}")
+        print("-"*60)
+        
+        for check in validation_result.get('checks', []):
+            status = check.get('status', 'UNKNOWN')
+            if status == 'PASS':
+                status_icon = '✓'
+                status_color = '\033[92m'
+            elif status == 'FAIL':
+                status_icon = '✗'
+                status_color = '\033[91m'
+            elif status == 'SKIP':
+                status_icon = '⚪'
+                status_color = '\033[93m'
+            elif status == 'ERROR':
+                status_icon = '✕'
+                status_color = '\033[95m'
             else:
-                print("\n✓ 所有验证通过！")
+                status_icon = '?'
+                status_color = '\033[0m'
+            
+            reset_color = '\033[0m'
+            print(f"  {status_color}{status_icon}{reset_color} {check['check_name']}: {check['message']}")
+            
+            if status in ['FAIL', 'ERROR'] and check.get('expected') is not None:
+                print(f"      预期: {check['expected']}")
+                print(f"      实际: {check['actual']}")
+        
+        if validation_result.get('error'):
+            print(f"\n错误详情: {validation_result['error']}")
+            if validation_result.get('traceback'):
+                print(f"堆栈: {validation_result['traceback']}")
+        
+        if validation_result['overall_status'] == 'FAIL':
+            print("\n验证失败！")
+            sys.exit(1)
+        elif validation_result['overall_status'] == 'WARNING':
+            print("\n验证有警告（所有检查跳过或无有效检查）")
+        else:
+            print("\n✓ 所有验证通过！")
     
     elif args.mode == 'validate':
-        print("验证模式: 正在加载配置和数据...")
+        generator.load_config()
+        generator.setup_logging()
         
-        if not generator.load_config():
-            print("错误: 无法加载配置文件")
+        if not generator.load_results():
+            print("\n错误: 无法加载之前的运行结果。请先运行 -m run 或 -m both")
             sys.exit(1)
         
-        if not generator.setup_logging():
-            print("错误: 无法初始化日志系统")
-            sys.exit(1)
+        print("\n" + "="*60)
+        print("开始验证结果（从上次运行加载）...")
+        print("="*60)
         
-        print("\n开始验证结果...")
         validator = WeeklyReportValidator(generator)
         validation_result = validator.validate_with_expected(args.expected)
         
         summary = validation_result.get('summary', {})
         print(f"\n验证结果: {validation_result['overall_status']}")
         print(f"  通过: {summary.get('pass_count', 0)}, 失败: {summary.get('fail_count', 0)}, 跳过: {summary.get('skip_count', 0)}, 错误: {summary.get('error_count', 0)}")
+        print("-"*60)
         
         for check in validation_result.get('checks', []):
-            status_icon = '✓' if check['status'] == 'PASS' else '✗' if check['status'] == 'FAIL' else '⚪' if check['status'] == 'SKIP' else '?'
+            status = check.get('status', 'UNKNOWN')
+            if status == 'PASS':
+                status_icon = '✓'
+            elif status == 'FAIL':
+                status_icon = '✗'
+            elif status == 'SKIP':
+                status_icon = '⚪'
+            else:
+                status_icon = '?'
             print(f"  {status_icon} {check['check_name']}: {check['message']}")
+            
+            if status == 'FAIL' and check.get('expected') is not None:
+                print(f"      预期: {check['expected']}")
+                print(f"      实际: {check['actual']}")
         
         if validation_result['overall_status'] in ['FAIL', 'ERROR']:
+            print("\n验证失败！")
             sys.exit(1)
     
     print("\n" + "="*60)
@@ -1616,3 +1825,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

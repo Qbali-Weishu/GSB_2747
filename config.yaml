@@ -9,9 +9,6 @@ weekly_report:
     enabled: true
     date_field: "订单日期"
     source_table: "销售明细"
-    auto_detect_week: true
-    custom_start_date: null
-    custom_end_date: null
 
   data_sources:
     - name: "销售明细"
